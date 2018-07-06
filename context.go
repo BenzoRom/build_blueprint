@@ -102,6 +102,8 @@ type Context struct {
 	requiredNinjaMinor int          // For the ninja_required_version variable
 	requiredNinjaMicro int          // For the ninja_required_version variable
 
+	subninjas []string
+
 	// set lazily by sortedModuleGroups
 	cachedSortedModuleGroups []*moduleGroup
 
@@ -2944,6 +2946,11 @@ func (c *Context) WriteBuildFile(w io.Writer) error {
 		return err
 	}
 
+	err = c.writeSubninjas(nw)
+	if err != nil {
+		return err
+	}
+
 	// TODO: Group the globals by package.
 
 	err = c.writeGlobalVariables(nw)
@@ -3050,6 +3057,13 @@ func (c *Context) writeNinjaRequiredVersion(nw *ninjaWriter) error {
 		return err
 	}
 
+	return nw.BlankLine()
+}
+
+func (c *Context) writeSubninjas(nw *ninjaWriter) error {
+	for _, subninja := range c.subninjas {
+		nw.Subninja(subninja)
+	}
 	return nw.BlankLine()
 }
 
