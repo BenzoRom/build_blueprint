@@ -25,8 +25,9 @@ import (
 	"github.com/google/blueprint/deptools"
 )
 
-var GlobMultipleRecursiveErr = errors.New("pattern contains multiple **")
-var GlobLastRecursiveErr = errors.New("pattern ** as last path element")
+var GlobMultipleRecursiveErr = errors.New("pattern contains multiple '**'")
+var GlobLastRecursiveErr = errors.New("pattern has '**' as last path element")
+var GlobInvalidRecursiveErr = errors.New("pattern contains other characters between '**' and path separator")
 
 // Glob returns the list of files and directories that match the given pattern
 // but do not match the given exclude patterns, along with the list of
@@ -39,15 +40,17 @@ var GlobLastRecursiveErr = errors.New("pattern ** as last path element")
 // In general ModuleContext.GlobWithDeps or SingletonContext.GlobWithDeps
 // should be used instead, as they will automatically set up dependencies
 // to rerun the primary builder when the list of matching files changes.
-func Glob(pattern string, excludes []string) (matches, deps []string, err error) {
-	return startGlob(OsFs, pattern, excludes)
+func Glob(pattern string, excludes []string, follow ShouldFollowSymlinks) (matches, deps []string, err error) {
+	return startGlob(OsFs, pattern, excludes, follow)
 }
 
-func startGlob(fs FileSystem, pattern string, excludes []string) (matches, deps []string, err error) {
+func startGlob(fs FileSystem, pattern string, excludes []string,
+	follow ShouldFollowSymlinks) (matches, deps []string, err error) {
+
 	if filepath.Base(pattern) == "**" {
 		return nil, nil, GlobLastRecursiveErr
 	} else {
-		matches, deps, err = glob(fs, pattern, false)
+		matches, deps, err = glob(fs, pattern, false, follow)
 	}
 
 	if err != nil {
@@ -73,10 +76,24 @@ func startGlob(fs FileSystem, pattern string, excludes []string) (matches, deps 
 	}
 
 	for i, match := range matches {
-		if isDir, err := fs.IsDir(match); err != nil {
-			return nil, nil, fmt.Errorf("IsDir(%s): %s", match, err.Error())
-		} else if isDir {
-			matches[i] = match + "/"
+		isSymlink, err := fs.IsSymlink(match)
+		if err != nil {
+			return nil, nil, err
+		}
+		if !(isSymlink && follow == DontFollowSymlinks) {
+			isDir, err := fs.IsDir(match)
+			if os.IsNotExist(err) {
+				if isSymlink {
+					return nil, nil, fmt.Errorf("%s: dangling symlink", match)
+				}
+			}
+			if err != nil {
+				return nil, nil, fmt.Errorf("%s: %s", match, err.Error())
+			}
+
+			if isDir {
+				matches[i] = match + "/"
+			}
 		}
 	}
 
@@ -85,7 +102,9 @@ func startGlob(fs FileSystem, pattern string, excludes []string) (matches, deps 
 
 // glob is a recursive helper function to handle globbing each level of the pattern individually,
 // allowing searched directories to be tracked.  Also handles the recursive glob pattern, **.
-func glob(fs FileSystem, pattern string, hasRecursive bool) (matches, dirs []string, err error) {
+func glob(fs FileSystem, pattern string, hasRecursive bool,
+	follow ShouldFollowSymlinks) (matches, dirs []string, err error) {
+
 	if !isWild(pattern) {
 		// If there are no wilds in the pattern, check whether the file exists or not.
 		// Uses filepath.Glob instead of manually statting to get consistent results.
@@ -100,7 +119,7 @@ func glob(fs FileSystem, pattern string, hasRecursive bool) (matches, dirs []str
 			// as a dependency.
 			var matchDirs []string
 			for len(matchDirs) == 0 {
-				pattern, _ = saneSplit(pattern)
+				pattern = filepath.Dir(pattern)
 				matchDirs, err = fs.glob(pattern)
 				if err != nil {
 					return matches, dirs, err
@@ -118,26 +137,36 @@ func glob(fs FileSystem, pattern string, hasRecursive bool) (matches, dirs []str
 			return matches, dirs, GlobMultipleRecursiveErr
 		}
 		hasRecursive = true
+	} else if strings.Contains(file, "**") {
+		return matches, dirs, GlobInvalidRecursiveErr
 	}
 
-	dirMatches, dirs, err := glob(fs, dir, hasRecursive)
+	dirMatches, dirs, err := glob(fs, dir, hasRecursive, follow)
 	if err != nil {
 		return nil, nil, err
 	}
 
 	for _, m := range dirMatches {
-		if isDir, err := fs.IsDir(m); err != nil {
+		isDir, err := fs.IsDir(m)
+		if os.IsNotExist(err) {
+			if isSymlink, _ := fs.IsSymlink(m); isSymlink {
+				return nil, nil, fmt.Errorf("dangling symlink: %s", m)
+			}
+		}
+		if err != nil {
 			return nil, nil, fmt.Errorf("unexpected error after glob: %s", err)
-		} else if isDir {
+		}
+
+		if isDir {
 			if file == "**" {
-				recurseDirs, err := fs.ListDirsRecursive(m)
+				recurseDirs, err := fs.ListDirsRecursive(m, follow)
 				if err != nil {
 					return nil, nil, err
 				}
 				matches = append(matches, recurseDirs...)
 			} else {
 				dirs = append(dirs, m)
-				newMatches, err := fs.glob(filepath.Join(m, file))
+				newMatches, err := fs.glob(filepath.Join(MatchEscape(m), file))
 				if err != nil {
 					return nil, nil, err
 				}
@@ -216,24 +245,55 @@ func filterDotFiles(matches []string) []string {
 }
 
 // Match returns true if name matches pattern using the same rules as filepath.Match, but supporting
-// hierarchical patterns (a/*) and recursive globs (**).
+// recursive globs (**).
 func Match(pattern, name string) (bool, error) {
 	if filepath.Base(pattern) == "**" {
 		return false, GlobLastRecursiveErr
 	}
 
+	patternDir := pattern[len(pattern)-1] == '/'
+	nameDir := name[len(name)-1] == '/'
+
+	if patternDir != nameDir {
+		return false, nil
+	}
+
+	if nameDir {
+		name = name[:len(name)-1]
+		pattern = pattern[:len(pattern)-1]
+	}
+
 	for {
 		var patternFile, nameFile string
-		pattern, patternFile = saneSplit(pattern)
-		name, nameFile = saneSplit(name)
+		pattern, patternFile = filepath.Dir(pattern), filepath.Base(pattern)
 
 		if patternFile == "**" {
-			return matchPrefix(pattern, filepath.Join(name, nameFile))
+			if strings.Contains(pattern, "**") {
+				return false, GlobMultipleRecursiveErr
+			}
+			// Test if the any prefix of name matches the part of the pattern before **
+			for {
+				if name == "." || name == "/" {
+					return name == pattern, nil
+				}
+				if match, err := filepath.Match(pattern, name); err != nil {
+					return false, err
+				} else if match {
+					return true, nil
+				}
+				name = filepath.Dir(name)
+			}
+		} else if strings.Contains(patternFile, "**") {
+			return false, GlobInvalidRecursiveErr
 		}
 
-		if nameFile == "" && patternFile == "" {
+		name, nameFile = filepath.Dir(name), filepath.Base(name)
+
+		if nameFile == "." && patternFile == "." {
 			return true, nil
-		} else if nameFile == "" || patternFile == "" {
+		} else if nameFile == "/" && patternFile == "/" {
+			return true, nil
+		} else if nameFile == "." || patternFile == "." || nameFile == "/" || patternFile == "/" {
 			return false, nil
 		}
 
@@ -242,56 +302,6 @@ func Match(pattern, name string) (bool, error) {
 			return match, err
 		}
 	}
-}
-
-// matchPrefix returns true if the beginning of name matches pattern using the same rules as
-// filepath.Match, but supporting hierarchical patterns (a/*).  Recursive globs (**) are not
-// supported, they should have been handled in Match().
-func matchPrefix(pattern, name string) (bool, error) {
-	if len(pattern) > 0 && pattern[0] == '/' {
-		if len(name) > 0 && name[0] == '/' {
-			pattern = pattern[1:]
-			name = name[1:]
-		} else {
-			return false, nil
-		}
-	}
-
-	for {
-		var patternElem, nameElem string
-		patternElem, pattern = saneSplitFirst(pattern)
-		nameElem, name = saneSplitFirst(name)
-
-		if patternElem == "." {
-			patternElem = ""
-		}
-		if nameElem == "." {
-			nameElem = ""
-		}
-
-		if patternElem == "**" {
-			return false, GlobMultipleRecursiveErr
-		}
-
-		if patternElem == "" {
-			return true, nil
-		} else if nameElem == "" {
-			return false, nil
-		}
-
-		match, err := filepath.Match(patternElem, nameElem)
-		if err != nil || !match {
-			return match, err
-		}
-	}
-}
-
-func saneSplitFirst(path string) (string, string) {
-	i := strings.IndexRune(path, filepath.Separator)
-	if i < 0 {
-		return path, ""
-	}
-	return path[:i], path[i+1:]
 }
 
 func GlobPatternList(patterns []string, prefix string) (globedList []string, depDirs []string, err error) {
@@ -305,7 +315,7 @@ func GlobPatternList(patterns []string, prefix string) (globedList []string, dep
 
 	for _, pattern := range patterns {
 		if isWild(pattern) {
-			matches, deps, err = Glob(filepath.Join(prefix, pattern), nil)
+			matches, deps, err = Glob(filepath.Join(prefix, pattern), nil, FollowSymlinks)
 			if err != nil {
 				return nil, nil, err
 			}
@@ -349,7 +359,7 @@ func HasGlob(in []string) bool {
 // should be used instead, as they will automatically set up dependencies
 // to rerun the primary builder when the list of matching files changes.
 func GlobWithDepFile(glob, fileListFile, depFile string, excludes []string) (files []string, err error) {
-	files, deps, err := Glob(glob, excludes)
+	files, deps, err := Glob(glob, excludes, FollowSymlinks)
 	if err != nil {
 		return nil, err
 	}
@@ -413,4 +423,16 @@ func WriteFileIfChanged(filename string, data []byte, perm os.FileMode) error {
 	}
 
 	return nil
+}
+
+var matchEscaper = strings.NewReplacer(
+	`*`, `\*`,
+	`?`, `\?`,
+	`[`, `\[`,
+	`]`, `\]`,
+)
+
+// MatchEscape returns its inputs with characters that would be interpreted by
+func MatchEscape(s string) string {
+	return matchEscaper.Replace(s)
 }
