@@ -154,6 +154,8 @@ func (matchString) MatchString(pat, str string) (bool, error) {
 	return MatchString(pat, str)
 }
 
+func (matchString) SetPanicOnExit0(bool) {}
+
 func (matchString) StartCPUProfile(w io.Writer) error {
 	panic("shouldn't get here")
 }
